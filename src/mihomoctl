@@ -1164,14 +1164,43 @@ def cmd_sub_update(args):
         die("subscription URL is empty", EXIT_INVALID_INPUT)
 
     print("downloading subscription...")
-    req = urllib.request.Request(url, headers={"User-Agent": "mihomo/1.0"})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as r:
-            content = r.read().decode()
-    except urllib.error.URLError as e:
-        die(f"download failed: {e}", EXIT_API_DOWN)
 
+    def _download(dl_url, ua):
+        req = urllib.request.Request(dl_url, headers={"User-Agent": ua})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return r.read().decode()
+
+    # Try clash UA first — many servers return native Clash YAML (with
+    # full proxy groups, all node types including hysteria2, etc.)
+    content = None
+    for ua in ("clash", "mihomo/1.0"):
+        try:
+            content = _download(url, ua)
+            break
+        except urllib.error.URLError as e:
+            last_err = e
+            continue
+    else:
+        die(f"download failed: {last_err}", EXIT_API_DOWN)
+
+    # If the response is YAML but only has vmess proxies, try
+    # flag=clashmeta — some servers hide hysteria2/trojan behind it.
     data = yaml.safe_load(content)
+    if isinstance(data, dict):
+        ptypes = {p.get("type") for p in data.get("proxies") or []}
+        if ptypes and ptypes == {"vmess"}:
+            try:
+                alt_url = url + ("&" if "?" in url else "?") + "flag=clashmeta"
+                alt_content = _download(alt_url, "clash")
+                alt_data = yaml.safe_load(alt_content)
+                if isinstance(alt_data, dict):
+                    alt_types = {p.get("type") for p in alt_data.get("proxies") or []}
+                    if len(alt_types) > len(ptypes):
+                        content = alt_content
+                        data = alt_data
+                        print(f"  using flag=clashmeta ({len(alt_data.get('proxies', []))} proxies)")
+            except Exception:
+                pass
     if not isinstance(data, dict):
         # Attempt 1: base64-encoded Clash YAML
         for encoding in ("base64",):
