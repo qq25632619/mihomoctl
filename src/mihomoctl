@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 import argparse
+import base64
 import getpass
 import json
 import os
+import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -11,6 +14,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from urllib.parse import parse_qs, unquote
 
 import yaml
 
@@ -24,6 +28,9 @@ STATE = VAR / "state.json"
 
 CONTROLLER = "http://127.0.0.1:9090"
 MIXED_PORT = 7890
+MIHOMO_BIN = "/usr/local/bin/mihomo"
+MIHOMO_PID = VAR / "mihomo.pid"
+MIHOMO_LOG = VAR / "mihomo.log"
 
 # Exit codes
 EXIT_OK = 0
@@ -51,6 +58,137 @@ def die(msg, code=EXIT_GENERAL):
 def need_root(action):
     if os.geteuid() != 0:
         die(f"{action} needs root. Run: sudo mihomoctl ...", EXIT_DEPENDENCY)
+
+
+def has_systemd():
+    """Return True if systemd is running (not a Docker container)."""
+    return Path("/run/systemd/system").exists()
+
+
+def ensure_systemd(action):
+    """Check systemd. Print warning and return False if unavailable."""
+    if has_systemd():
+        return True
+    print(f"note: systemd not available, using direct process management",
+          file=sys.stderr)
+    return False
+
+
+# ── Direct process management (fallback when systemd is absent) ────────────
+
+def _pid_is_alive(pid):
+    """Return True if process with given pid exists."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
+def _read_pid():
+    """Read mihomo PID from file, or None."""
+    if not MIHOMO_PID.exists():
+        return None
+    try:
+        return int(MIHOMO_PID.read_text().strip())
+    except (ValueError, OSError):
+        return None
+
+
+def mihomo_is_running():
+    """Check whether mihomo is running (direct or systemd)."""
+    if has_systemd():
+        return subprocess.run(
+            ["systemctl", "is-active", "--quiet", "mihomo.service"],
+            stderr=subprocess.DEVNULL,
+        ).returncode == 0
+    pid = _read_pid()
+    return pid is not None and _pid_is_alive(pid)
+
+
+def mihomo_start():
+    """Start mihomo directly (no systemd)."""
+    if mihomo_is_running():
+        print("mihomo is already running")
+        return
+
+    VAR.mkdir(parents=True, exist_ok=True)
+    with open(MIHOMO_LOG, "a") as log:
+        proc = subprocess.Popen(
+            [MIHOMO_BIN, "-d", str(ETC)],
+            stdout=log, stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    MIHOMO_PID.write_text(str(proc.pid) + "\n")
+
+    # Wait briefly for crash
+    time.sleep(1.5)
+    if not _pid_is_alive(proc.pid):
+        MIHOMO_PID.unlink(missing_ok=True)
+        tail = ""
+        try:
+            lines = MIHOMO_LOG.read_text().splitlines()
+            tail = "\n".join(lines[-5:])
+        except Exception:
+            pass
+        die(f"mihomo failed to start. Last log lines:\n{tail}", EXIT_API_DOWN)
+
+    print("mihomo started")
+
+
+def mihomo_stop():
+    """Stop mihomo directly (no systemd)."""
+    pid = _read_pid()
+    if pid is None or not _pid_is_alive(pid):
+        MIHOMO_PID.unlink(missing_ok=True)
+        print("mihomo is not running")
+        return
+
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(10):
+        time.sleep(0.3)
+        if not _pid_is_alive(pid):
+            break
+    else:
+        # Force kill
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        time.sleep(0.3)
+    MIHOMO_PID.unlink(missing_ok=True)
+    print("mihomo stopped")
+
+
+def mihomo_restart():
+    """Restart mihomo directly (no systemd)."""
+    if mihomo_is_running():
+        mihomo_stop()
+        time.sleep(0.5)
+    mihomo_start()
+
+
+def mihomo_service(action):
+    """Start/stop/restart mihomo: use systemd if available, else direct."""
+    if has_systemd():
+        if action == "start":
+            subprocess.run(["systemctl", "start", "mihomo.service"],
+                           stderr=subprocess.DEVNULL, check=True)
+        elif action == "stop":
+            subprocess.run(["systemctl", "stop", "mihomo.service"],
+                           stderr=subprocess.DEVNULL, check=True)
+        elif action == "restart":
+            subprocess.run(["systemctl", "restart", "mihomo.service"],
+                           stderr=subprocess.DEVNULL, check=True)
+        return
+
+    # Direct process management
+    if action == "start":
+        mihomo_start()
+    elif action == "stop":
+        mihomo_stop()
+    elif action == "restart":
+        mihomo_restart()
 
 
 def read_state():
@@ -85,6 +223,406 @@ def save_yaml(path, data):
             default_flow_style=False,
         )
     )
+
+
+# ── Proxy Link Parser ───────────────────────────────────────────────────────
+# Converts vmess:// / vless:// / ss:// / trojan:// / hysteria:// links
+# into Clash/Mihomo proxy dicts.
+
+def _first(params, key):
+    """Safely get first value from parse_qs result."""
+    vals = params.get(key, [])
+    return vals[0] if vals else None
+
+
+def parse_vmess_uri(uri):
+    """Parse vmess://base64(JSON) → Clash proxy dict."""
+    b64 = uri[len("vmess://"):]
+    try:
+        text = base64.b64decode(b64, validate=True).decode()
+    except Exception:
+        return None
+    try:
+        j = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+    server = j.get("add", "")
+    if not server:
+        return None
+
+    name = j.get("ps", "").strip() or f"vmess-{server}"
+    proxy = {
+        "name": name,
+        "type": "vmess",
+        "server": server,
+        "port": int(j.get("port", 0)),
+        "uuid": j.get("id", ""),
+        "alterId": int(j.get("aid", 0)),
+        "cipher": j.get("scy", "auto"),
+    }
+
+    net = j.get("net", "tcp")
+    if net == "ws":
+        proxy["network"] = "ws"
+        opts = {"path": j.get("path", "/")}
+        host = j.get("host", "")
+        if host:
+            opts["headers"] = {"Host": host}
+        proxy["ws-opts"] = opts
+    elif net == "h2":
+        proxy["network"] = "h2"
+        opts = {"path": j.get("path", "/")}
+        host = j.get("host", "")
+        if host:
+            opts["host"] = [host]
+        proxy["h2-opts"] = opts
+    elif net == "grpc":
+        proxy["network"] = "grpc"
+        svc = j.get("path", "").lstrip("/")
+        proxy["grpc-opts"] = {"grpc-service-name": svc}
+
+    if j.get("tls", "") == "tls":
+        proxy["tls"] = True
+        proxy["servername"] = j.get("sni") or j.get("host") or server
+
+    return proxy
+
+
+def parse_vless_uri(uri):
+    """Parse vless://uuid@server:port?params#name → Clash proxy dict."""
+    rest = uri[len("vless://"):]
+
+    fragment = ""
+    if "#" in rest:
+        rest, fragment = rest.rsplit("#", 1)
+        fragment = unquote(fragment)
+
+    if "@" not in rest:
+        return None
+
+    uuid, _, server_part = rest.partition("@")
+
+    if "?" in server_part:
+        host_port, _, query = server_part.partition("?")
+    else:
+        host_port, query = server_part, ""
+
+    server, _, port_str = host_port.partition(":")
+    port = int(port_str) if port_str else 443
+
+    params = parse_qs(query) if query else {}
+
+    proxy = {
+        "name": fragment or f"vless-{server}",
+        "type": "vless",
+        "server": server,
+        "port": port,
+        "uuid": uuid,
+    }
+
+    net = _first(params, "type") or "tcp"
+    security = _first(params, "security") or "none"
+
+    if net == "ws":
+        proxy["network"] = "ws"
+        opts = {"path": _first(params, "path") or "/"}
+        host = _first(params, "host")
+        if host:
+            opts["headers"] = {"Host": host}
+        proxy["ws-opts"] = opts
+    elif net == "grpc":
+        proxy["network"] = "grpc"
+        proxy["grpc-opts"] = {"grpc-service-name": _first(params, "serviceName") or ""}
+
+    if security == "tls":
+        proxy["tls"] = True
+        sni = _first(params, "sni")
+        if sni:
+            proxy["servername"] = sni
+    elif security == "reality":
+        proxy["tls"] = True
+        reality = {}
+        pbk = _first(params, "pbk")
+        sid = _first(params, "sid")
+        if pbk:
+            reality["public-key"] = pbk
+        if sid:
+            reality["short-id"] = sid
+        if reality:
+            proxy["reality-opts"] = reality
+        sni = _first(params, "sni")
+        if sni:
+            proxy["servername"] = sni
+
+    flow = _first(params, "flow")
+    if flow:
+        proxy["flow"] = flow
+
+    return proxy
+
+
+def parse_trojan_uri(uri):
+    """Parse trojan://password@server:port?params#name → Clash proxy dict."""
+    rest = uri[len("trojan://"):]
+
+    fragment = ""
+    if "#" in rest:
+        rest, fragment = rest.rsplit("#", 1)
+        fragment = unquote(fragment)
+
+    if "@" not in rest:
+        return None
+
+    password, _, server_part = rest.partition("@")
+
+    if "?" in server_part:
+        host_port, _, query = server_part.partition("?")
+    else:
+        host_port, query = server_part, ""
+
+    server, _, port_str = host_port.partition(":")
+    port = int(port_str) if port_str else 443
+
+    params = parse_qs(query) if query else {}
+
+    proxy = {
+        "name": fragment or f"trojan-{server}",
+        "type": "trojan",
+        "server": server,
+        "port": port,
+        "password": password,
+    }
+
+    sni = _first(params, "sni") or _first(params, "peer")
+    if sni:
+        proxy["sni"] = sni
+
+    if _first(params, "allowInsecure") == "1":
+        proxy["skip-cert-verify"] = True
+
+    net = _first(params, "type") or "tcp"
+    if net == "ws":
+        proxy["network"] = "ws"
+        opts = {"path": _first(params, "path") or "/"}
+        host = _first(params, "host")
+        if host:
+            opts["headers"] = {"Host": host}
+        proxy["ws-opts"] = opts
+
+    return proxy
+
+
+def parse_ss_uri(uri):
+    """Parse ss:// URI → Clash proxy dict (SIP002 + legacy)."""
+    rest = uri[len("ss://"):]
+
+    fragment = ""
+    if "#" in rest:
+        rest, fragment = rest.rsplit("#", 1)
+        fragment = unquote(fragment)
+
+    def _b64decode(s):
+        for pad in ("", "=", "=="):
+            try:
+                return base64.b64decode(s + pad).decode()
+            except Exception:
+                pass
+        raise ValueError(f"bad base64: {s[:20]}")
+
+    if "@" in rest:
+        b64, _, host_port = rest.partition("@")
+        try:
+            decoded = _b64decode(b64)
+        except Exception:
+            return None
+        method, _, password = decoded.partition(":")
+        server, _, port_str = host_port.partition(":")
+        port = int(port_str) if port_str else 8388
+    else:
+        try:
+            decoded = _b64decode(rest)
+        except Exception:
+            return None
+        method_pw, _, server_port = decoded.rpartition("@")
+        if not server_port:
+            return None
+        method, _, password = method_pw.partition(":")
+        server, _, port_str = server_port.partition(":")
+        port = int(port_str) if port_str else 8388
+
+    if not server:
+        return None
+
+    return {
+        "name": fragment or f"ss-{server}",
+        "type": "ss",
+        "server": server,
+        "port": port,
+        "cipher": method,
+        "password": password,
+    }
+
+
+def parse_hysteria_uri(uri):
+    """Parse hysteria:// or hysteria2:// → Clash proxy dict."""
+    is_v2 = uri.startswith("hysteria2://")
+    prefix = "hysteria2://" if is_v2 else "hysteria://"
+    rest = uri[len(prefix):]
+
+    fragment = ""
+    if "#" in rest:
+        rest, fragment = rest.rsplit("#", 1)
+        fragment = unquote(fragment)
+
+    auth = ""
+    if "@" in rest:
+        auth, _, server_part = rest.partition("@")
+    else:
+        server_part = rest
+
+    if "?" in server_part:
+        host_port, _, query = server_part.partition("?")
+    else:
+        host_port, query = server_part, ""
+
+    server, _, port_str = host_port.partition(":")
+    port = int(port_str) if port_str else (443 if is_v2 else 1080)
+
+    params = parse_qs(query) if query else {}
+
+    if is_v2:
+        proxy = {
+            "name": fragment or f"hysteria2-{server}",
+            "type": "hysteria2",
+            "server": server,
+            "port": port,
+            "password": auth or _first(params, "auth") or "",
+        }
+    else:
+        proxy = {
+            "name": fragment or f"hysteria-{server}",
+            "type": "hysteria",
+            "server": server,
+            "port": port,
+            "auth-str": auth or _first(params, "auth") or "",
+            "protocol": _first(params, "protocol") or "udp",
+        }
+
+    sni = _first(params, "sni") or _first(params, "peer")
+    if sni:
+        proxy["sni"] = sni
+
+    if _first(params, "insecure") == "1":
+        proxy["skip-cert-verify"] = True
+
+    obfs = _first(params, "obfs")
+    if obfs:
+        proxy["obfs"] = obfs
+        pw = _first(params, "obfs-password")
+        if pw:
+            proxy["obfs-password"] = pw
+
+    return proxy
+
+
+PROXY_PARSERS = {
+    "vmess://":     parse_vmess_uri,
+    "vless://":     parse_vless_uri,
+    "trojan://":    parse_trojan_uri,
+    "ss://":        parse_ss_uri,
+    "hysteria2://": parse_hysteria_uri,
+    "hysteria://":  parse_hysteria_uri,
+}
+
+
+def proxy_links_to_config(text):
+    """Convert proxy-link text (one URI per line) into a Clash YAML config dict.
+    Returns the config dict, or None if no proxies were parsed."""
+    proxies = []
+    seen = set()
+    dup_counter = {}
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        for prefix, parser in PROXY_PARSERS.items():
+            if line.startswith(prefix):
+                proxy = parser(line)
+                if proxy:
+                    name = proxy["name"]
+                    if name in seen:
+                        dup_counter[name] = dup_counter.get(name, 1) + 1
+                        proxy["name"] = f"{name} {dup_counter[name]}"
+                    else:
+                        seen.add(name)
+                    proxies.append(proxy)
+                break
+        else:
+            if "://" in line:
+                print(f"  warning: unsupported scheme: {line[:80]}",
+                      file=sys.stderr)
+
+    if not proxies:
+        return None
+
+    # Filter metadata entries injected by some providers
+    _META_KW = ["剩余流量", "套餐到期", "到期时间", "官网", "过滤掉",
+                "公告", "免费节点", "已过期", "请续费", "订阅地址",
+                "更新订阅", "线路数", "过期时间"]
+    real = [p for p in proxies if not any(kw in p["name"] for kw in _META_KW)]
+    if not real:
+        real = proxies
+
+    # Auto-group by region prefix (text before first "-")
+    region_groups = {}
+    for p in real:
+        name = p["name"]
+        if "-" in name:
+            region = name.split("-")[0].strip()
+            if region not in region_groups:
+                region_groups[region] = []
+            region_groups[region].append(name)
+
+    all_names = [p["name"] for p in real]
+    groups = []
+
+    # Per-region groups (regions with >= 2 proxies)
+    for region in sorted(region_groups):
+        names = region_groups[region]
+        if len(names) >= 2:
+            groups.append({
+                "name": region,
+                "type": "select",
+                "proxies": names + ["DIRECT"],
+            })
+
+    # Global groups
+    groups += [
+        {
+            "name": "Proxy",
+            "type": "select",
+            "proxies": all_names + ["DIRECT"],
+        },
+        {
+            "name": "Auto",
+            "type": "url-test",
+            "proxies": all_names,
+            "url": "http://www.gstatic.com/generate_204",
+            "interval": 300,
+        },
+    ]
+
+    config = {
+        "proxies": real,
+        "proxy-groups": groups,
+        "rules": [
+            "MATCH,Proxy",
+        ],
+    }
+    return config
 
 
 def generate_config():
@@ -311,7 +849,11 @@ def cmd_node_pick(args):
     if not result:
         raise SystemExit(EXIT_OK)
 
-    node = result.lstrip("* ").strip()
+    try:
+        idx = items.index(result)
+    except ValueError:
+        die("invalid selection", EXIT_GENERAL)
+    node = nodes[idx]
 
     select_node(group, node)
 
@@ -323,8 +865,8 @@ def test_node_latency(group, node):
     """Returns latency in ms or None on timeout."""
     try:
         path = f"/proxies/{urllib.parse.quote(group, safe='')}/delay"
-        params = f"timeout=5000&url=http://www.gstatic.com/generate_204&target={urllib.parse.quote(node, safe='')}"
-        data = http_json("GET", f"{path}?{params}")
+        params = f"timeout=2000&url=http://www.gstatic.com/generate_204&target={urllib.parse.quote(node, safe='')}"
+        data = http_json("GET", f"{path}?{params}", timeout=4)
         return data.get("delay")
     except Exception:
         return None
@@ -415,7 +957,12 @@ def cmd_node_group(args):
     if not result:
         raise SystemExit(EXIT_OK)
 
-    group = result.split("  ")[0].lstrip("* ").strip()
+    # Match by index (items may contain spaces in names)
+    try:
+        idx = items.index(result)
+    except ValueError:
+        die("invalid selection", EXIT_GENERAL)
+    group = groups[idx][0]
 
     # Pick node within group
     nodes = group_members(proxies[group])
@@ -443,14 +990,24 @@ def cmd_node_group(args):
 
 def cmd_enable(args):
     need_root("enabling mihomo")
-    subprocess.run(["systemctl", "enable", "--now", "mihomo.service"], check=True)
-    print("mihomo enabled and started")
+    if has_systemd():
+        subprocess.run(["systemctl", "enable", "mihomo.service"],
+                       stderr=subprocess.DEVNULL, check=True)
+    mihomo_service("start")
+    if has_systemd():
+        print("mihomo enabled and started")
+    else:
+        print("mihomo started (use 'mihomoctl disable' to stop)")
 
 
 def cmd_disable(args):
     need_root("disabling mihomo")
-    subprocess.run(["systemctl", "disable", "--now", "mihomo.service"], check=True)
-    print("mihomo stopped and disabled")
+    if has_systemd():
+        subprocess.run(["systemctl", "disable", "--now", "mihomo.service"],
+                       stderr=subprocess.DEVNULL, check=True)
+        print("mihomo stopped and disabled")
+    else:
+        mihomo_stop()
 
 
 def cmd_status(args):
@@ -458,13 +1015,9 @@ def cmd_status(args):
 
     # Service section
     print("\033[1m── Service ──────────────\033[0m")
-    try:
-        subprocess.run(
-            ["systemctl", "is-active", "--quiet", "mihomo.service"],
-            check=True,
-        )
+    if mihomo_is_running():
         print("  status:     \033[32mactive\033[0m")
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    else:
         print("  status:     \033[31minactive\033[0m")
 
     try:
@@ -547,7 +1100,8 @@ def cmd_mode(args):
 
     generate_config()
 
-    subprocess.run(["systemctl", "restart", "mihomo.service"], check=True)
+    if mihomo_is_running():
+        mihomo_service("restart")
 
     print(f"mode switched to: {args.value}")
 
@@ -619,6 +1173,41 @@ def cmd_sub_update(args):
 
     data = yaml.safe_load(content)
     if not isinstance(data, dict):
+        # Attempt 1: base64-encoded Clash YAML
+        for encoding in ("base64",):
+            try:
+                decoded = base64.b64decode(content, validate=True).decode()
+                data = yaml.safe_load(decoded)
+                if isinstance(data, dict):
+                    content = decoded
+                    break
+            except Exception:
+                pass
+        else:
+            # Attempt 2: base64-encoded proxy links → convert to config
+            decoded_text = None
+            try:
+                decoded_text = base64.b64decode(content, validate=True).decode()
+            except Exception:
+                pass
+
+            for candidate in (content, decoded_text):
+                if not candidate:
+                    continue
+                if candidate.startswith(("vmess://", "vless://", "trojan://",
+                                          "ss://", "hysteria://", "hysteria2://")):
+                    config = proxy_links_to_config(candidate)
+                    if config:
+                        data = config
+                        content = yaml.safe_dump(
+                            data, allow_unicode=True, sort_keys=False,
+                            default_flow_style=False,
+                        )
+                        print(f"  converted {len(config.get('proxies', []))} proxies to Clash format")
+                        break
+
+    if not isinstance(data, dict):
+        print(content[:1000], file=sys.stderr)
         die("downloaded subscription is not a YAML object", EXIT_INVALID_INPUT)
 
     if not any(k in data for k in ("proxies", "proxy-providers", "proxy-groups", "rules")):
@@ -631,15 +1220,15 @@ def cmd_sub_update(args):
 
     generate_config()
 
-    if subprocess.run(["systemctl", "is-active", "--quiet", "mihomo.service"]).returncode == 0:
-        subprocess.run(["systemctl", "restart", "mihomo.service"], check=True)
+    if mihomo_is_running():
+        mihomo_service("restart")
 
     print("subscription updated")
 
 
 def cmd_restart(args):
     need_root("restarting mihomo")
-    subprocess.run(["systemctl", "restart", "mihomo.service"], check=True)
+    mihomo_service("restart")
     print("mihomo restarted")
 
 
@@ -648,17 +1237,18 @@ def cmd_sub_cycle(args):
 
     # Read current timer interval
     current = "6h"
-    try:
-        result = subprocess.run(
-            ["systemctl", "show", "mihomo-update.timer", "--property=OnUnitActiveSec"],
-            capture_output=True, text=True
-        )
-        if result.returncode == 0:
-            val = result.stdout.split("=", 1)[1].strip()
-            if val:
-                current = val
-    except Exception:
-        pass
+    if has_systemd():
+        try:
+            result = subprocess.run(
+                ["systemctl", "show", "mihomo-update.timer", "--property=OnUnitActiveSec"],
+                capture_output=True, text=True, stderr=subprocess.DEVNULL,
+            )
+            if result.returncode == 0:
+                val = result.stdout.split("=", 1)[1].strip()
+                if val:
+                    current = val
+        except Exception:
+            pass
 
     options = ["1h", "2h", "4h", "6h", "12h", "24h", "custom"]
 
@@ -714,10 +1304,14 @@ def cmd_sub_cycle(args):
         with open(timer_path, "w") as f:
             f.write(new_content)
 
-        # Reload systemd and restart timer
-        subprocess.run(["systemctl", "daemon-reload"], check=True)
-        if subprocess.run(["systemctl", "is-active", "--quiet", "mihomo-update.timer"]).returncode == 0:
-            subprocess.run(["systemctl", "restart", "mihomo-update.timer"], check=True)
+        # Reload systemd and restart timer (skip if no systemd)
+        if has_systemd():
+            subprocess.run(["systemctl", "daemon-reload"],
+                           stderr=subprocess.DEVNULL, check=True)
+            if subprocess.run(["systemctl", "is-active", "--quiet", "mihomo-update.timer"],
+                              stderr=subprocess.DEVNULL).returncode == 0:
+                subprocess.run(["systemctl", "restart", "mihomo-update.timer"],
+                               stderr=subprocess.DEVNULL, check=True)
 
         print(f"  update cycle set to: {choice}")
     except Exception as e:

@@ -31,13 +31,22 @@ SYSCONFDIR="${SYSCONFDIR:-/etc}"
 UNITDIR="${UNITDIR:-/etc/systemd/system}"
 
 clone_repo() {
+    # If running from within the repo, use local files — no network needed.
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    if [[ -f "$script_dir/src/mihomoctl" ]]; then
+        info "Detected local repo at $script_dir, using local files..."
+        echo "$script_dir"
+        return
+    fi
+
     info "Cloning mihomoctl to $INSTALL_DIR..."
     if [[ -d "$INSTALL_DIR/.git" ]]; then
         info "Repository already exists at $INSTALL_DIR, pulling..."
         git -C "$INSTALL_DIR" pull --ff-only >&2 || error "Git pull failed"
     else
         mkdir -p "$(dirname "$INSTALL_DIR")"
-        git clone "$REPO" "$INSTALL_DIR" >&2
+        git clone "$REPO" "$INSTALL_DIR" >&2 || error "Git clone failed"
     fi
     echo "$INSTALL_DIR"
 }
@@ -82,7 +91,6 @@ install_deps() {
 }
 
 install_mihomo() {
-    info "Downloading mihomo..."
     local arch
     arch="$(uname -m)"
     case "$arch" in
@@ -92,15 +100,26 @@ install_mihomo() {
         *)       error "Unsupported architecture: $arch (supported: x86_64, aarch64, armv7l)" ;;
     esac
 
-    local tmpdir
-    tmpdir="$(mktemp -d)"
-
     local tag
     tag="$(curl -sL "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest" | grep -o '"tag_name": *"[^"]*"' | cut -d'"' -f4)"
     if [[ -z "$tag" ]]; then
-        rm -rf "$tmpdir"
         error "Failed to fetch latest mihomo version from GitHub"
     fi
+
+    # Skip if already installed and version matches.
+    if [[ -x "$BINDIR/mihomo" ]]; then
+        local installed_ver
+        installed_ver="$("$BINDIR/mihomo" --version 2>/dev/null | grep -oP 'v?\d+\.\d+\.\d+' | head -1)"
+        if [[ "$installed_ver" == "$tag" ]]; then
+            info "mihomo $tag already installed, skipping download."
+            return
+        fi
+        info "mihomo $installed_ver found, upgrading to $tag..."
+    fi
+
+    info "Downloading mihomo..."
+    local tmpdir
+    tmpdir="$(mktemp -d)"
 
     local url="https://github.com/MetaCubeX/mihomo/releases/download/${tag}/mihomo-linux-${arch}-compatible-${tag}.gz"
     info "Fetching: $url"
@@ -160,7 +179,7 @@ install_files() {
 
 enable_services() {
     info "Reloading systemd..."
-    systemctl daemon-reload
+    systemctl daemon-reload 2>/dev/null || true
 }
 
 show_install_complete() {
